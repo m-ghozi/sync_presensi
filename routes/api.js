@@ -6,6 +6,8 @@ const router = express.Router();
 const syncController = require('../controllers/syncController');
 
 router.get('/sync', syncController.syncData);
+router.post('/sync/date', syncController.syncDataByDate);
+router.get('/sync/date', syncController.syncDataByDate);
 
 // Export router agar bisa digunakan di index.js
 module.exports = router;
