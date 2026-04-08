@@ -1,5 +1,23 @@
 const { localPool, vpsPool } = require('../config/database');
 
+// Fungsi untuk menghitung selisih jam (durasi)
+function hitungDurasi(jamDatang, jamPulang) {
+    // Ubah string tanggal menjadi timestamp, ganti spasi dengan T agar valid di semua OS
+    const waktuMulai = new Date(jamDatang.replace(' ', 'T')).getTime();
+    const waktuSelesai = new Date(jamPulang.replace(' ', 'T')).getTime();
+
+    const diffMs = waktuSelesai - waktuMulai;
+
+    // Jika hasilnya negatif (error logika waktu), kembalikan default
+    if (diffMs <= 0) return '00:00:00';
+
+    const h = Math.floor(diffMs / 3600000);
+    const m = Math.floor((diffMs % 3600000) / 60000);
+    const s = Math.floor((diffMs % 60000) / 1000);
+
+    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
 async function syncData(req, res) {
     let connectionLocal;
     let connectionVps;
@@ -31,22 +49,29 @@ async function syncData(req, res) {
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `;
 
-        // Mendukung pulang di hari yang berbeda: cari baris terakhir yang belum ada jam_pulangnya
-        const queryUpdatePulang = `
-            UPDATE rekap_presensi 
-            SET jam_pulang = ? 
+        // Query untuk mencari jam_datang terakhir yang masih menggantung (belum pulang)
+        const queryFindOpenRecord = `
+            SELECT jam_datang 
+            FROM rekap_presensi 
             WHERE id = ? AND jam_datang <= ? AND (jam_pulang IS NULL OR jam_pulang = '0000-00-00 00:00:00' OR jam_pulang = '')
             ORDER BY jam_datang DESC
             LIMIT 1
         `;
 
+        // Query update sekarang ditargetkan secara spesifik ke jam_datang yang ditemukan
+        const queryUpdatePulang = `
+            UPDATE rekap_presensi 
+            SET jam_pulang = ?, durasi = ? 
+            WHERE id = ? AND jam_datang = ?
+        `;
+
         const [keterlambatanRows] = await connectionLocal.execute('SELECT toleransi, terlambat1, terlambat2 FROM set_keterlambatan LIMIT 1');
         const setKeterlambatan = keterlambatanRows.length > 0 ? keterlambatanRows[0] : { toleransi: 0, terlambat1: 0, terlambat2: 0 };
-        
+
         const [jamMasukRows] = await connectionLocal.execute('SELECT shift, jam_masuk FROM jam_masuk');
         const jamMasukMap = {};
-        for(let j of jamMasukRows) {
-             jamMasukMap[j.shift] = j.jam_masuk;
+        for (let j of jamMasukRows) {
+            jamMasukMap[j.shift] = j.jam_masuk;
         }
 
         let successCount = 0;
@@ -64,7 +89,7 @@ async function syncData(req, res) {
             if (parsedData.type !== 'attlog' || !parsedData.data) continue;
 
             const pinKaryawan = parsedData.data.pin;
-            
+
             // Cek id pegawai berdasarkan NIK (pin)
             let pegawaiId = pegawaiCache[pinKaryawan];
             if (pegawaiId === undefined) {
@@ -121,11 +146,11 @@ async function syncData(req, res) {
                 const shiftJamMasuk = jamMasukMap[shift];
                 const scanTime = new Date(waktuScan.replace(' ', 'T')).getTime();
                 const shiftTime = new Date(`${tanggalScan}T${shiftJamMasuk}`).getTime();
-                
+
                 const diffMs = scanTime - shiftTime;
                 if (diffMs > 0) {
                     const diffMins = Math.floor(diffMs / 60000);
-                    
+
                     if (diffMins > 0 && diffMins <= setKeterlambatan.toleransi) {
                         status = 'Terlambat Toleransi';
                     } else if (diffMins > setKeterlambatan.toleransi && diffMins <= setKeterlambatan.terlambat1) {
@@ -133,7 +158,7 @@ async function syncData(req, res) {
                     } else if (diffMins > setKeterlambatan.terlambat1) {
                         status = 'Terlambat II';
                     }
-                    
+
                     const h = Math.floor(diffMs / 3600000);
                     const m = Math.floor((diffMs % 3600000) / 60000);
                     const s = Math.floor((diffMs % 60000) / 1000);
@@ -142,6 +167,9 @@ async function syncData(req, res) {
             }
 
             let durasi = '00:00:00';
+
+
+
             let keterangan = 'Sinkronisasi Otomatis';
             let photo = '';
 
@@ -157,7 +185,7 @@ async function syncData(req, res) {
                     keterangan,
                     photo
                 ]);
-                
+
                 if (insertResult.affectedRows > 0) {
                     console.log(`[DEBUG] Insert MASUK sukses untuk PIN: ${pinKaryawan} pada ${waktuScan}`);
                     successCount++;
@@ -167,17 +195,40 @@ async function syncData(req, res) {
 
             } else if (statusScan === 1) {
                 // LOGIKA: ABSEN PULANG
-                // Cari baris absen masuk terakhir yang belum ditutup, meskipun beda hari
-                const [updateResult] = await connectionLocal.execute(queryUpdatePulang, [
-                    waktuScan,   // SET jam_pulang
-                    pegawaiId,   // WHERE id
-                    waktuScan    // AND jam_datang <= ?
+
+                // 1. Cari baris absen masuk terakhir yang belum ditutup
+                const [openRecords] = await connectionLocal.execute(queryFindOpenRecord, [
+                    pegawaiId,
+                    waktuScan // jam_datang <= waktuScan (tidak boleh pulang mendahului jam datang)
                 ]);
 
-                if (updateResult.affectedRows > 0) {
-                    successCount++;
+                if (openRecords.length > 0) {
+                    let jamDatangDb = openRecords[0].jam_datang;
+
+                    // Format handling: Jika mysql2 mengembalikan tipe Date object, ubah ke string format MySQL
+                    let strJamDatang = jamDatangDb;
+                    if (typeof jamDatangDb === 'object') {
+                        // Memastikan menggunakan zona waktu lokal, bukan UTC
+                        const tzoffset = (new Date()).getTimezoneOffset() * 60000;
+                        strJamDatang = (new Date(jamDatangDb - tzoffset)).toISOString().slice(0, 19).replace('T', ' ');
+                    }
+
+                    // 2. Hitung Durasi
+                    let durasiDihitung = hitungDurasi(strJamDatang, waktuScan);
+
+                    // 3. Update database dengan jam pulang dan durasi baru
+                    const [updateResult] = await connectionLocal.execute(queryUpdatePulang, [
+                        waktuScan,      // SET jam_pulang
+                        durasiDihitung, // SET durasi
+                        pegawaiId,      // WHERE id
+                        jamDatangDb     // AND jam_datang = ? (menggunakan original reference)
+                    ]);
+
+                    if (updateResult.affectedRows > 0) {
+                        successCount++;
+                    }
                 } else {
-                    console.log(`[INFO] Karyawan ${pinKaryawan} absen pulang tanggal ${tanggalScan} tapi tidak ada data absen masuknya.`);
+                    console.log(`[INFO] Karyawan ${pinKaryawan} absen pulang pada ${waktuScan} tapi tidak ditemukan data absen masuk yang masih terbuka.`);
                 }
             }
         }
@@ -235,22 +286,29 @@ async function syncDataByDate(req, res) {
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `;
 
-        // Mendukung pulang di hari yang berbeda: cari baris terakhir yang belum ada jam_pulangnya
-        const queryUpdatePulang = `
-            UPDATE rekap_presensi 
-            SET jam_pulang = ? 
+        // Query untuk mencari jam_datang terakhir yang masih menggantung (belum pulang)
+        const queryFindOpenRecord = `
+            SELECT jam_datang 
+            FROM rekap_presensi 
             WHERE id = ? AND jam_datang <= ? AND (jam_pulang IS NULL OR jam_pulang = '0000-00-00 00:00:00' OR jam_pulang = '')
             ORDER BY jam_datang DESC
             LIMIT 1
         `;
 
+        // Query update sekarang ditargetkan secara spesifik ke jam_datang yang ditemukan
+        const queryUpdatePulang = `
+            UPDATE rekap_presensi 
+            SET jam_pulang = ?, durasi = ? 
+            WHERE id = ? AND jam_datang = ?
+        `;
+
         const [keterlambatanRows] = await connectionLocal.execute('SELECT toleransi, terlambat1, terlambat2 FROM set_keterlambatan LIMIT 1');
         const setKeterlambatan = keterlambatanRows.length > 0 ? keterlambatanRows[0] : { toleransi: 0, terlambat1: 0, terlambat2: 0 };
-        
+
         const [jamMasukRows] = await connectionLocal.execute('SELECT shift, jam_masuk FROM jam_masuk');
         const jamMasukMap = {};
-        for(let j of jamMasukRows) {
-             jamMasukMap[j.shift] = j.jam_masuk;
+        for (let j of jamMasukRows) {
+            jamMasukMap[j.shift] = j.jam_masuk;
         }
 
         let successCount = 0;
@@ -325,11 +383,11 @@ async function syncDataByDate(req, res) {
                 const shiftJamMasuk = jamMasukMap[shift];
                 const scanTime = new Date(waktuScan.replace(' ', 'T')).getTime();
                 const shiftTime = new Date(`${tanggalScan}T${shiftJamMasuk}`).getTime();
-                
+
                 const diffMs = scanTime - shiftTime;
                 if (diffMs > 0) {
                     const diffMins = Math.floor(diffMs / 60000);
-                    
+
                     if (diffMins > 0 && diffMins <= setKeterlambatan.toleransi) {
                         status = 'Terlambat Toleransi';
                     } else if (diffMins > setKeterlambatan.toleransi && diffMins <= setKeterlambatan.terlambat1) {
@@ -337,7 +395,7 @@ async function syncDataByDate(req, res) {
                     } else if (diffMins > setKeterlambatan.terlambat1) {
                         status = 'Terlambat II';
                     }
-                    
+
                     const h = Math.floor(diffMs / 3600000);
                     const m = Math.floor((diffMs % 3600000) / 60000);
                     const s = Math.floor((diffMs % 60000) / 1000);
@@ -361,27 +419,49 @@ async function syncDataByDate(req, res) {
                     keterangan,
                     photo
                 ]);
-                
+
                 if (insertResult.affectedRows > 0) {
                     console.log(`[DEBUG] Insert MASUK sukses untuk PIN: ${pinKaryawan} pada ${waktuScan}`);
                     successCount++;
                 } else {
                     console.log(`[DEBUG] Insert MASUK diabaikan (sudah ada / data master PIN ${pinKaryawan} tidak ada di tabel pegawai) pada ${waktuScan}`);
                 }
-
             } else if (statusScan === 1) {
                 // LOGIKA: ABSEN PULANG
-                // Cari baris absen masuk terakhir yang belum ditutup, meskipun beda hari
-                const [updateResult] = await connectionLocal.execute(queryUpdatePulang, [
-                    waktuScan,   // SET jam_pulang
-                    pegawaiId,   // WHERE id
-                    waktuScan    // AND jam_datang <= ?
+
+                // 1. Cari baris absen masuk terakhir yang belum ditutup
+                const [openRecords] = await connectionLocal.execute(queryFindOpenRecord, [
+                    pegawaiId,
+                    waktuScan // jam_datang <= waktuScan (tidak boleh pulang mendahului jam datang)
                 ]);
 
-                if (updateResult.affectedRows > 0) {
-                    successCount++;
+                if (openRecords.length > 0) {
+                    let jamDatangDb = openRecords[0].jam_datang;
+
+                    // Format handling: Jika mysql2 mengembalikan tipe Date object, ubah ke string format MySQL
+                    let strJamDatang = jamDatangDb;
+                    if (typeof jamDatangDb === 'object') {
+                        // Memastikan menggunakan zona waktu lokal, bukan UTC
+                        const tzoffset = (new Date()).getTimezoneOffset() * 60000;
+                        strJamDatang = (new Date(jamDatangDb - tzoffset)).toISOString().slice(0, 19).replace('T', ' ');
+                    }
+
+                    // 2. Hitung Durasi
+                    let durasiDihitung = hitungDurasi(strJamDatang, waktuScan);
+
+                    // 3. Update database dengan jam pulang dan durasi baru
+                    const [updateResult] = await connectionLocal.execute(queryUpdatePulang, [
+                        waktuScan,      // SET jam_pulang
+                        durasiDihitung, // SET durasi
+                        pegawaiId,      // WHERE id
+                        jamDatangDb     // AND jam_datang = ? (menggunakan original reference)
+                    ]);
+
+                    if (updateResult.affectedRows > 0) {
+                        successCount++;
+                    }
                 } else {
-                    console.log(`[INFO] Karyawan ${pinKaryawan} absen pulang tanggal ${tanggalScan} tapi tidak ada data absen masuknya.`);
+                    console.log(`[INFO] Karyawan ${pinKaryawan} absen pulang pada ${waktuScan} tapi tidak ditemukan data absen masuk yang masih terbuka.`);
                 }
             }
         }
