@@ -31,10 +31,13 @@ async function syncData(req, res) {
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `;
 
+        // Mendukung pulang di hari yang berbeda: cari baris terakhir yang belum ada jam_pulangnya
         const queryUpdatePulang = `
             UPDATE rekap_presensi 
             SET jam_pulang = ? 
-            WHERE id = ? AND DATE(jam_datang) = ?
+            WHERE id = ? AND jam_datang <= ? AND (jam_pulang IS NULL OR jam_pulang = '0000-00-00 00:00:00' OR jam_pulang = '')
+            ORDER BY jam_datang DESC
+            LIMIT 1
         `;
 
         const [keterlambatanRows] = await connectionLocal.execute('SELECT toleransi, terlambat1, terlambat2 FROM set_keterlambatan LIMIT 1');
@@ -109,9 +112,6 @@ async function syncData(req, res) {
                 if (shiftValue !== undefined && shiftValue !== null && shiftValue !== '') {
                     shift = shiftValue;
                 }
-            } else {
-                // Log hanya satu kali per karyawan per bulan
-                // console.log(`[WARNING] Jadwal tidak ditemukan untuk ID Pegawai: ${pegawaiId} pada ${scanYear}-${scanMonth}. Menggunakan default 'Pagi'.`);
             }
 
             let status = 'Tepat Waktu';
@@ -167,14 +167,13 @@ async function syncData(req, res) {
 
             } else if (statusScan === 1) {
                 // LOGIKA: ABSEN PULANG
-                // Kita update baris yang ID-nya sama, dan tanggal jam_datang-nya sama dengan hari ini
+                // Cari baris absen masuk terakhir yang belum ditutup, meskipun beda hari
                 const [updateResult] = await connectionLocal.execute(queryUpdatePulang, [
                     waktuScan,   // SET jam_pulang
                     pegawaiId,   // WHERE id
-                    tanggalScan  // AND DATE(jam_datang)
+                    waktuScan    // AND jam_datang <= ?
                 ]);
 
-                // Jika affectedRows > 0, berarti data masuknya ditemukan dan berhasil diupdate
                 if (updateResult.affectedRows > 0) {
                     successCount++;
                 } else {
@@ -236,10 +235,13 @@ async function syncDataByDate(req, res) {
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `;
 
+        // Mendukung pulang di hari yang berbeda: cari baris terakhir yang belum ada jam_pulangnya
         const queryUpdatePulang = `
             UPDATE rekap_presensi 
             SET jam_pulang = ? 
-            WHERE id = ? AND DATE(jam_datang) = ?
+            WHERE id = ? AND jam_datang <= ? AND (jam_pulang IS NULL OR jam_pulang = '0000-00-00 00:00:00' OR jam_pulang = '')
+            ORDER BY jam_datang DESC
+            LIMIT 1
         `;
 
         const [keterlambatanRows] = await connectionLocal.execute('SELECT toleransi, terlambat1, terlambat2 FROM set_keterlambatan LIMIT 1');
@@ -369,14 +371,13 @@ async function syncDataByDate(req, res) {
 
             } else if (statusScan === 1) {
                 // LOGIKA: ABSEN PULANG
-                // Kita update baris yang ID-nya sama, dan tanggal jam_datang-nya sama dengan hari ini
+                // Cari baris absen masuk terakhir yang belum ditutup, meskipun beda hari
                 const [updateResult] = await connectionLocal.execute(queryUpdatePulang, [
                     waktuScan,   // SET jam_pulang
                     pegawaiId,   // WHERE id
-                    tanggalScan  // AND DATE(jam_datang)
+                    waktuScan    // AND jam_datang <= ?
                 ]);
 
-                // Jika affectedRows > 0, berarti data masuknya ditemukan dan berhasil diupdate
                 if (updateResult.affectedRows > 0) {
                     successCount++;
                 } else {
