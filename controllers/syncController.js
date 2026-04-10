@@ -170,7 +170,7 @@ async function syncData(req, res) {
 
 
 
-            let keterangan = 'Sinkronisasi Otomatis';
+            let keterangan = 'Sinkronisasi Otomatis (Fingerprint)';
             let photo = '';
 
             if (statusScan === 0) {
@@ -404,7 +404,7 @@ async function syncDataByDate(req, res) {
             }
 
             let durasi = '00:00:00';
-            let keterangan = 'Sinkronisasi Otomatis (By Date)';
+            let keterangan = 'Sinkronisasi Otomatis (Fingerprint) (By Date)';
             let photo = '';
 
             if (statusScan === 0) {
